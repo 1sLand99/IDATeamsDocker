@@ -4,26 +4,25 @@ set -euo pipefail
 shopt -s nullglob
 
 ################################################################
-# Paths & Constants
+# Global cleanup (tmp files/dirs)
 ################################################################
 
-INSTALL_PATH="/opt/hexvault"
+declare -a CLEANUP_FILES=()
+declare -a CLEANUP_DIRS=()
 
-CA_PATH="${INSTALL_PATH}/CA"
-CONFIG_PATH="${INSTALL_PATH}/config"
-LOGS_PATH="${INSTALL_PATH}/logs"
-DATA_PATH="${INSTALL_PATH}/data"
+cleanup_add_file() { CLEANUP_FILES+=("$1"); }
+cleanup_add_dir()  { CLEANUP_DIRS+=("$1"); }
 
-SCHEMA_LOCK="${CONFIG_PATH}/hexvault_schema.lock"
-
-WORK_DIR="${INSTALL_PATH}/_gitmirror"
-REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID:-hexvault}"
-
-ARCHIVE_NAME="data.tar.zst"
-ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
-MANIFEST_NAME="manifest.json"
-
-SKIP_SCHEMA_RECREATE=0
+cleanup() {
+  set +e
+  for f in "${CLEANUP_FILES[@]:-}"; do
+    [[ -n "$f" && -f "$f" ]] && rm -f -- "$f"
+  done
+  for d in "${CLEANUP_DIRS[@]:-}"; do
+    [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+  done
+}
+trap cleanup EXIT
 
 ################################################################
 # App Configuration
@@ -57,16 +56,34 @@ GH_API="${GH_API:-}"
 GH_UPLOAD="${GH_UPLOAD:-}"
 
 ################################################################
+# Paths & Constants
+################################################################
+
+INSTALL_PATH="/opt/hexvault"
+
+CA_PATH="${INSTALL_PATH}/CA"
+CONFIG_PATH="${INSTALL_PATH}/config"
+LOGS_PATH="${INSTALL_PATH}/logs"
+DATA_PATH="${INSTALL_PATH}/data"
+
+SCHEMA_LOCK="${CONFIG_PATH}/hexvault_schema.lock"
+
+WORK_DIR="${INSTALL_PATH}/_gitmirror"
+REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID}"
+
+ARCHIVE_NAME="data.tar.zst"
+ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
+MANIFEST_NAME="manifest.json"
+
+SKIP_SCHEMA_RECREATE=0
+
+################################################################
 # Utils
 ################################################################
 
-now_utc() {
-  date -u +'%Y-%m-%dT%H:%M:%SZ'
-}
+now_utc() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
-log() {
-  printf '[%s] %s\n' "$(now_utc)" "$*"
-}
+log() { printf '[%s] %s\n' "$(now_utc)" "$*"; }
 
 die() {
   printf '[%s] ERROR: %s\n' "$(now_utc)" "$*" >&2
@@ -93,10 +110,32 @@ pack_payload() {
   printf '%s %s\n' "$size" "$sha"
 }
 
+# IMPORTANT:
+# - Archive is .tar.zst, so we must decompress via zstd.
+# - Restore is atomic-ish: extract to temp dir, then swap DATA_PATH.
 import_payload() {
-  rm -rf "${DATA_PATH:?}/"* "${DATA_PATH}/."[!.]* 2>/dev/null || true
-  mkdir -p "$DATA_PATH"
-  tar -C "$DATA_PATH" -xpf "$1"
+  local archive="$1"
+  local tmp_dir old_dir
+
+  tmp_dir="$(mktemp -d "${INSTALL_PATH}/_data_restore.XXXXXX")"
+  cleanup_add_dir "$tmp_dir"
+
+  mkdir -p "$tmp_dir"
+
+  # Extract into temp dir
+  zstd -dc -- "$archive" | tar -C "$tmp_dir" -xpf -
+
+  # Swap directories (same filesystem because tmp is under INSTALL_PATH)
+  old_dir="${DATA_PATH}.old.$(date +%s)"
+  if [[ -d "$DATA_PATH" ]]; then
+    mv -- "$DATA_PATH" "$old_dir"
+    cleanup_add_dir "$old_dir"
+  fi
+
+  mv -- "$tmp_dir" "$DATA_PATH"
+
+  # Best-effort cleanup old dir now that new data is in place
+  [[ -d "$old_dir" ]] && rm -rf -- "$old_dir" || true
 }
 
 ################################################################
@@ -136,13 +175,14 @@ write_manifest() {
   local parts=( "${REMOTE_DIR}/${ARCHIVE_NAME}.part_"* )
   local cnt="${#parts[@]}"
 
+  # Store numeric fields as numbers
   jq -n \
-    --arg host_id            "${SYNC_HOST_ID}" \
-    --arg timestamp_utc      "$ts" \
-    --arg chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
-    --arg chunk_count        "${cnt}" \
-    --arg archive_size_bytes "${size}" \
-    --arg archive_sha256     "$sha" \
+    --arg host_id       "${SYNC_HOST_ID}" \
+    --arg timestamp_utc "$ts" \
+    --argjson chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
+    --argjson chunk_count        "${cnt}" \
+    --argjson archive_size_bytes "${size}" \
+    --arg archive_sha256 "$sha" \
     '{
        host_id:            $host_id,
        timestamp_utc:      $timestamp_utc,
@@ -158,9 +198,13 @@ write_manifest() {
 restore_from_remote() {
   local tmp sha_remote sha_local
 
+  [[ -f "${REMOTE_DIR}/${MANIFEST_NAME}" ]] \
+    || die "Manifest not found: ${REMOTE_DIR}/${MANIFEST_NAME}"
+
   tmp="${INSTALL_PATH}/_restore"
   rm -rf "$tmp"
   mkdir -p "$tmp"
+  cleanup_add_dir "$tmp"
 
   assemble_remote_archive "$tmp/${ARCHIVE_NAME}"
 
@@ -171,7 +215,6 @@ restore_from_remote() {
     || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
 
   import_payload "$tmp/${ARCHIVE_NAME}"
-  rm -rf "$tmp"
 
   SKIP_SCHEMA_RECREATE=1
   log "Restore completed (sha=$sha_remote)"
@@ -183,7 +226,7 @@ restore_from_remote() {
 
 ensure_tools_commits() {
   local missing=()
-  local tools=(git ssh-keyscan tar zstd jq sha256sum split openssl)
+  local tools=(git ssh ssh-keyscan tar zstd jq sha256sum split)
 
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -208,7 +251,7 @@ gh_git_mode_detect() {
       || die "SSH remote requires GH_SSH_PRIVATE_KEY"
     GH_MODE="SYNC"
   else
-    die "Unsupported GH_REMOTE scheme"
+    die "Unsupported GH_REMOTE scheme (use https:// or ssh:// / git@)"
   fi
 
   log "Commits mode: ${GH_MODE}"
@@ -296,7 +339,8 @@ gh_git_pull_hard() {
   else
     log "Remote branch '${GH_BRANCH}' not found (remote empty?)"
     git -C "$WORK_DIR" checkout --orphan "$GH_BRANCH"
-    git -C "$WORK_DIR" reset --hard
+    # Robust cleanup for unborn/orphan branch
+    git -C "$WORK_DIR" rm -rf . >/dev/null 2>&1 || true
     git -C "$WORK_DIR" clean -xfd
   fi
 
@@ -324,7 +368,7 @@ perform_commits_sync() {
     return 0
   fi
 
-  if [[ -z "$(ls -A "$DATA_PATH" 2>/dev/null)" && -n "$man" ]]; then
+  if [[ -z "$(ls -A "$DATA_PATH" 2>/dev/null || true)" && -n "$man" ]]; then
     log "FS empty -> restore from repo snapshot"
     restore_from_remote
     return 0
@@ -364,7 +408,7 @@ perform_commits_sync() {
 
 ensure_tools_releases() {
   local missing=()
-  local tools=(curl tar zstd jq sha256sum split openssl mktemp)
+  local tools=(curl tar zstd jq sha256sum split mktemp)
 
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -447,8 +491,14 @@ http_json() {
   local data="${3:-}"
   local ctype="${4:-application/json}"
 
+  # cleanup previous response file (if any)
+  if [[ -n "${HTTP_BODY_FILE:-}" && -f "${HTTP_BODY_FILE:-}" ]]; then
+    rm -f -- "${HTTP_BODY_FILE}" || true
+  fi
+
   local tmp
   tmp="$(mktemp)"
+  cleanup_add_file "$tmp"
 
   local code
   if [[ -n "$data" ]]; then
@@ -624,8 +674,7 @@ gh_download_asset_to() {
 perform_releases_sync() {
   ensure_tools_releases
 
-  [[ -n "$GH_REMOTE" ]] \
-    || die "GH_REMOTE is required for releases mode"
+  [[ -n "$GH_REMOTE" ]] || die "GH_REMOTE is required for releases mode"
 
   parse_gh_remote
   gh_auth_header
@@ -636,6 +685,7 @@ perform_releases_sync() {
   local tmp="${INSTALL_PATH}/_ghrel"
   rm -rf "$tmp"
   mkdir -p "$tmp"
+  cleanup_add_dir "$tmp"
 
   if gh_download_asset_to "${MANIFEST_NAME}" "${tmp}/${MANIFEST_NAME}"; then
     local man sha_remote
@@ -647,22 +697,18 @@ perform_releases_sync() {
 
       local cnt i part
       cnt="$(jq -r '.chunk_count' <<<"$man")"
-      [[ -n "$cnt" && "$cnt" != "null" ]] \
-        || die "Invalid manifest (chunk_count)"
+      [[ -n "$cnt" && "$cnt" != "null" ]] || die "Invalid manifest (chunk_count)"
 
       for ((i=0;i<cnt;i++)); do
         part=$(printf '%s.part_%03d' "$ARCHIVE_NAME" "$i")
-        gh_download_asset_to "$part" "${tmp}/${part}" \
-          || die "Missing asset $part"
+        gh_download_asset_to "$part" "${tmp}/${part}" || die "Missing asset $part"
       done
 
       cat "${tmp}/${ARCHIVE_NAME}.part_"* > "${tmp}/${ARCHIVE_NAME}"
 
       local sha_local
       sha_local="$(sha256sum "${tmp}/${ARCHIVE_NAME}" | awk '{print $1}')"
-
-      [[ "$sha_local" == "$sha_remote" ]] \
-        || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
+      [[ "$sha_local" == "$sha_remote" ]] || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
 
       import_payload "${tmp}/${ARCHIVE_NAME}"
       SKIP_SCHEMA_RECREATE=1
@@ -677,22 +723,18 @@ perform_releases_sync() {
 
       local cnt i part
       cnt="$(jq -r '.chunk_count' <<<"$man")"
-      [[ -n "$cnt" && "$cnt" != "null" ]] \
-        || die "Invalid manifest (chunk_count)"
+      [[ -n "$cnt" && "$cnt" != "null" ]] || die "Invalid manifest (chunk_count)"
 
       for ((i=0;i<cnt;i++)); do
         part=$(printf '%s.part_%03d' "$ARCHIVE_NAME" "$i")
-        gh_download_asset_to "$part" "${tmp}/${part}" \
-          || die "Missing asset $part"
+        gh_download_asset_to "$part" "${tmp}/${part}" || die "Missing asset $part"
       done
 
       cat "${tmp}/${ARCHIVE_NAME}.part_"* > "${tmp}/${ARCHIVE_NAME}"
 
       local sha_local
       sha_local="$(sha256sum "${tmp}/${ARCHIVE_NAME}" | awk '{print $1}')"
-
-      [[ "$sha_local" == "$sha_remote" ]] \
-        || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
+      [[ "$sha_local" == "$sha_remote" ]] || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
 
       import_payload "${tmp}/${ARCHIVE_NAME}"
       SKIP_SCHEMA_RECREATE=1
@@ -766,8 +808,7 @@ mkdir -p \
   "$WORK_DIR" \
   "$REMOTE_DIR"
 
-cd "$INSTALL_PATH" \
-  || die "Failed to cd into $INSTALL_PATH"
+cd "$INSTALL_PATH" || die "Failed to cd into $INSTALL_PATH"
 
 CONFIG_FILE="${CONFIG_PATH}/hexvault.conf"
 
@@ -794,8 +835,7 @@ else
 fi
 
 log "Patching license"
-python3 "${INSTALL_PATH}/license_patch.py" hexvault \
-  || die "Patch failed"
+python3 "${INSTALL_PATH}/license_patch.py" hexvault || die "Patch failed"
 
 chown root:root "${INSTALL_PATH}/vault_server" || true
 chmod 755       "${INSTALL_PATH}/vault_server" || true
@@ -816,6 +856,8 @@ fi
 log "Generating TLS cert via local CA"
 
 OPENSSL_CFG="$(mktemp)"
+cleanup_add_file "$OPENSSL_CFG"
+
 cat >"$OPENSSL_CFG" <<EOF
 [req]
 distinguished_name=req_distinguished_name
@@ -851,7 +893,7 @@ openssl x509 \
   -extfile "$OPENSSL_CFG" \
   >/dev/null 2>&1 || die "CRT failed"
 
-rm -f "${CONFIG_PATH}/hexvault.csr" "$OPENSSL_CFG"
+rm -f "${CONFIG_PATH}/hexvault.csr" "$OPENSSL_CFG" || true
 
 if id -u hexvault >/dev/null 2>&1; then
   chown hexvault:hexvault \

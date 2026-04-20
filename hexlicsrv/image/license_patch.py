@@ -336,10 +336,9 @@ def patch_file(file_path: Path) -> bool:
 
 # Main
 
-def generate_id(ID_0: int = randint(0x00, 0xFF), ID_1: int = randint(0x00, 0xFF),
-                ID_2: int = randint(0x00, 0xFF), ID_3: int = randint(0x00, 0xFF),
-                ID_4: int = randint(0x00, 0xFF), ID_5: int = randint(0x00, 0xFF)) -> list:
-    return [ID_0, ID_1, ID_2, ID_3, ID_4, ID_5]
+def generate_id(ID_0=None, ID_1=None, ID_2=None, ID_3=None, ID_4=None, ID_5=None) -> list:
+    values = [ID_0, ID_1, ID_2, ID_3, ID_4, ID_5]
+    return [randint(0x00, 0xFF) if v is None else v for v in values]
 
 def format_id(id:list) -> str:
     return f'{id[0]:02X}-{id[1]:02X}{id[2]:02X}-{id[3]:02X}{id[4]:02X}-{id[5]:02X}'

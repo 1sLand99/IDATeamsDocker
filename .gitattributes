@@ -1,1 +1,2 @@
 *.reg text=auto eol=crlf charset=utf-8
+*.sh  text eol=lf

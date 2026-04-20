@@ -3,7 +3,7 @@ FROM debian:12
 EXPOSE 443
 
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y netcat-openbsd curl python3 git openssh-client zstd jq tar ca-certificates default-mysql-client && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y netcat-openbsd curl python3 git openssh-client zstd jq tar ca-certificates default-mysql-client openssl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

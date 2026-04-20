@@ -2,29 +2,28 @@
 
 set -euo pipefail
 shopt -s nullglob
+umask 027
 
 ################################################################
-# Paths & Constants
+# Global cleanup (tmp files/dirs)
 ################################################################
 
-INSTALL_PATH="/opt/lumina"
+declare -a CLEANUP_FILES=()
+declare -a CLEANUP_DIRS=()
 
-CA_PATH="${INSTALL_PATH}/CA"
-CONFIG_PATH="${INSTALL_PATH}/config"
-LOGS_PATH="${INSTALL_PATH}/logs"
-DATA_PATH="${INSTALL_PATH}/data"
+cleanup_add_file() { CLEANUP_FILES+=("$1"); }
+cleanup_add_dir()  { CLEANUP_DIRS+=("$1"); }
 
-SCHEMA_LOCK="${CONFIG_PATH}/lumina_schema.lock"
-
-WORK_DIR="${INSTALL_PATH}/_gitmirror"
-REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID:-lumina}"
-
-DUMP_PATH="${INSTALL_PATH}/dump.sql"
-ARCHIVE_NAME="dump.sql.zst"
-ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
-MANIFEST_NAME="manifest.json"
-
-SKIP_SCHEMA_RECREATE=0
+cleanup() {
+  set +e
+  for f in "${CLEANUP_FILES[@]:-}"; do
+    [[ -n "$f" && -f "$f" ]] && rm -f -- "$f"
+  done
+  for d in "${CLEANUP_DIRS[@]:-}"; do
+    [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+  done
+}
+trap cleanup EXIT
 
 ################################################################
 # App Configuration (MySQL)
@@ -35,6 +34,9 @@ MYSQL_PORT="${MYSQL_PORT:-3306}"
 MYSQL_DATABASE="${MYSQL_DATABASE:-lumina}"
 MYSQL_USER="${MYSQL_USER:-lumina}"
 MYSQL_PASSWORD="${MYSQL_PASSWORD:-lumina}"
+
+# Optional: how long to wait for TCP connect to MySQL (seconds)
+MYSQL_WAIT_TIMEOUT="${MYSQL_WAIT_TIMEOUT:-300}"
 
 LUMINA_HOST="${LUMINA_HOST:-localhost}"
 LUMINA_PORT="${LUMINA_PORT:-443}"
@@ -68,28 +70,58 @@ GH_API="${GH_API:-}"
 GH_UPLOAD="${GH_UPLOAD:-}"
 
 ################################################################
+# Paths & Constants
+################################################################
+
+INSTALL_PATH="/opt/lumina"
+
+CA_PATH="${INSTALL_PATH}/CA"
+CONFIG_PATH="${INSTALL_PATH}/config"
+LOGS_PATH="${INSTALL_PATH}/logs"
+DATA_PATH="${INSTALL_PATH}/data"
+
+SCHEMA_LOCK="${CONFIG_PATH}/lumina_schema.lock"
+
+WORK_DIR="${INSTALL_PATH}/_gitmirror"
+REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID}"
+
+DUMP_PATH="${INSTALL_PATH}/dump.sql"
+ARCHIVE_NAME="dump.sql.zst"
+ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
+MANIFEST_NAME="manifest.json"
+
+SKIP_SCHEMA_RECREATE=0
+
+################################################################
 # Utils
 ################################################################
 
-now_utc() {
-  date -u +'%Y-%m-%dT%H:%M:%SZ'
-}
+now_utc() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
-log() {
-  printf '[%s] %s\n' "$(now_utc)" "$*"
-}
+log() { printf '[%s] %s\n' "$(now_utc)" "$*"; }
 
 die() {
   printf '[%s] ERROR: %s\n' "$(now_utc)" "$*" >&2
   exit 1
 }
 
+# Avoid dependency on nc: use bash /dev/tcp
 wait_for_db() {
-  log "Waiting for MySQL ${MYSQL_HOST}:${MYSQL_PORT}..."
-  until nc -z "$MYSQL_HOST" "$MYSQL_PORT"; do
+  log "Waiting for MySQL TCP ${MYSQL_HOST}:${MYSQL_PORT} (timeout=${MYSQL_WAIT_TIMEOUT}s)..."
+
+  local deadline=$((SECONDS + MYSQL_WAIT_TIMEOUT))
+  while true; do
+    if (echo >/dev/tcp/"$MYSQL_HOST"/"$MYSQL_PORT") >/dev/null 2>&1; then
+      log "MySQL TCP port is reachable"
+      return 0
+    fi
+
+    if (( SECONDS >= deadline )); then
+      die "MySQL is not reachable at ${MYSQL_HOST}:${MYSQL_PORT} (timeout ${MYSQL_WAIT_TIMEOUT}s)"
+    fi
+
     sleep 3
   done
-  log "MySQL is reachable"
 }
 
 mysql_query_scalar() {
@@ -119,7 +151,7 @@ db_is_empty() {
 ################################################################
 
 pack_payload() {
-  rm -f "$DUMP_PATH" "$ARCHIVE_PATH"
+  rm -f "$DUMP_PATH" "$ARCHIVE_PATH" || true
 
   log "Dumping DB '${MYSQL_DATABASE}' -> $ARCHIVE_PATH" >&2
 
@@ -140,6 +172,7 @@ pack_payload() {
     > "$DUMP_PATH"
 
   zstd -q -T0 -19 -o "$ARCHIVE_PATH" "$DUMP_PATH"
+  rm -f "$DUMP_PATH" || true
 
   local size sha
   size="$(stat -c '%s' "$ARCHIVE_PATH")"
@@ -150,7 +183,7 @@ pack_payload() {
 
 import_payload() {
   log "Importing DB from '$1'"
-  zstd -dc "$1" \
+  zstd -dc -- "$1" \
     | mysql --protocol=TCP \
         -h "$MYSQL_HOST" \
         -P "$MYSQL_PORT" \
@@ -195,13 +228,14 @@ write_manifest() {
   local parts=( "${REMOTE_DIR}/${ARCHIVE_NAME}.part_"* )
   local cnt="${#parts[@]}"
 
+  # Write numeric fields as numbers (argjson), not strings
   jq -n \
-    --arg host_id            "${SYNC_HOST_ID}" \
-    --arg timestamp_utc      "$ts" \
-    --arg chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
-    --arg chunk_count        "${cnt}" \
-    --arg archive_size_bytes "${size}" \
-    --arg archive_sha256     "$sha" \
+    --arg host_id       "${SYNC_HOST_ID}" \
+    --arg timestamp_utc "$ts" \
+    --argjson chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
+    --argjson chunk_count        "${cnt}" \
+    --argjson archive_size_bytes "${size}" \
+    --arg archive_sha256 "$sha" \
     '{
        host_id:            $host_id,
        timestamp_utc:      $timestamp_utc,
@@ -217,9 +251,11 @@ write_manifest() {
 restore_from_remote() {
   local tmp sha_remote sha_local
 
-  tmp="${INSTALL_PATH}/_dbrestore"
-  rm -rf "$tmp"
-  mkdir -p "$tmp"
+  [[ -f "${REMOTE_DIR}/${MANIFEST_NAME}" ]] \
+    || die "Manifest not found: ${REMOTE_DIR}/${MANIFEST_NAME}"
+
+  tmp="$(mktemp -d "${INSTALL_PATH}/_dbrestore.XXXXXX")"
+  cleanup_add_dir "$tmp"
 
   assemble_remote_archive "$tmp/${ARCHIVE_NAME}"
 
@@ -239,7 +275,6 @@ restore_from_remote() {
   fi
 
   import_payload "$tmp/${ARCHIVE_NAME}"
-  rm -rf "$tmp"
 
   SKIP_SCHEMA_RECREATE=1
   log "DB restore completed (sha=$sha_remote)"
@@ -251,7 +286,7 @@ restore_from_remote() {
 
 ensure_tools_commits() {
   local missing=()
-  local tools=(git ssh-keyscan zstd jq tar sha256sum split mysql mysqldump nc openssl)
+  local tools=(git ssh ssh-keyscan zstd jq sha256sum split mysql mysqldump openssl)
 
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -272,11 +307,10 @@ gh_git_mode_detect() {
       GH_MODE="HTTPS_PULLONLY"
     fi
   elif [[ "$GH_REMOTE" =~ ^git@ || "$GH_REMOTE" =~ ^ssh:// ]]; then
-    [[ -n "$GH_SSH_PRIVATE_KEY" ]] \
-      || die "SSH remote requires GH_SSH_PRIVATE_KEY"
+    [[ -n "$GH_SSH_PRIVATE_KEY" ]] || die "SSH remote requires GH_SSH_PRIVATE_KEY"
     GH_MODE="SYNC"
   else
-    die "Unsupported GH_REMOTE scheme"
+    die "Unsupported GH_REMOTE scheme (use https:// or ssh:// / git@)"
   fi
 
   log "Commits mode: ${GH_MODE}"
@@ -344,8 +378,8 @@ gh_git_setup() {
     fi
   fi
 
-  git -C "$WORK_DIR" config user.name  "${GH_COMMIT_NAME:-Lumina CI}"
-  git -C "$WORK_DIR" config user.email "${GH_COMMIT_EMAIL:-lumina@example.com}"
+  git -C "$WORK_DIR" config user.name  "${GH_COMMIT_NAME}"
+  git -C "$WORK_DIR" config user.email "${GH_COMMIT_EMAIL}"
 
   mkdir -p "$REMOTE_DIR"
 }
@@ -364,7 +398,8 @@ gh_git_pull_hard() {
   else
     log "Remote branch '${GH_BRANCH}' not found (remote empty?)"
     git -C "$WORK_DIR" checkout --orphan "$GH_BRANCH"
-    git -C "$WORK_DIR" reset --hard
+    # Robust cleanup for unborn/orphan branch
+    git -C "$WORK_DIR" rm -rf . >/dev/null 2>&1 || true
     git -C "$WORK_DIR" clean -xfd
   fi
 
@@ -374,6 +409,7 @@ gh_git_pull_hard() {
 perform_commits_sync() {
   ensure_tools_commits
   wait_for_db
+
   gh_git_mode_detect
   gh_git_setup
   gh_git_pull_hard
@@ -433,7 +469,7 @@ perform_commits_sync() {
 
 ensure_tools_releases() {
   local missing=()
-  local tools=(curl zstd jq sha256sum split mysql mysqldump nc openssl mktemp)
+  local tools=(curl zstd jq sha256sum split mysql mysqldump openssl mktemp)
 
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -516,8 +552,14 @@ http_json() {
   local data="${3:-}"
   local ctype="${4:-application/json}"
 
-  local tmp
-  tmp="$(mktemp)"
+  # cleanup previous response file (if any)
+  if [[ -n "${HTTP_BODY_FILE:-}" && -f "${HTTP_BODY_FILE:-}" ]]; then
+    rm -f -- "${HTTP_BODY_FILE}" || true
+  fi
+
+  local tmpf
+  tmpf="$(mktemp)"
+  cleanup_add_file "$tmpf"
 
   local code
   if [[ -n "$data" ]]; then
@@ -529,7 +571,7 @@ http_json() {
         -X "$method" \
         --data "$data" \
         "$url" \
-        -o "$tmp" || true
+        -o "$tmpf" || true
     )"
   else
     code="$(
@@ -538,12 +580,12 @@ http_json() {
         -H "Accept: application/vnd.github+json" \
         -X "$method" \
         "$url" \
-        -o "$tmp" || true
+        -o "$tmpf" || true
     )"
   fi
 
   HTTP_STATUS="$code"
-  HTTP_BODY_FILE="$tmp"
+  HTTP_BODY_FILE="$tmpf"
 }
 
 gh_get_release_id_by_tag() {
@@ -603,8 +645,7 @@ gh_list_assets() {
   local url="${GH_API}/repos/${GH_OWNER}/${GH_REPO}/releases/${GH_REL_ID}/assets?per_page=100"
 
   http_json "GET" "$url"
-  [[ "$HTTP_STATUS" == "200" ]] \
-    || die "GET $url failed (HTTP $HTTP_STATUS)"
+  [[ "$HTTP_STATUS" == "200" ]] || die "GET $url failed (HTTP $HTTP_STATUS)"
 
   cat "$HTTP_BODY_FILE"
 }
@@ -615,9 +656,7 @@ gh_delete_asset_id() {
 
   http_json "DELETE" "$url"
 
-  [[ "$HTTP_STATUS" =~ ^20[04]$ ]] \
-    || die "DELETE asset $id failed (HTTP $HTTP_STATUS)"
-
+  [[ "$HTTP_STATUS" =~ ^20[04]$ ]] || die "DELETE asset $id failed (HTTP $HTTP_STATUS)"
   log "Deleted asset id=$id"
 }
 
@@ -655,9 +694,7 @@ gh_upload_asset() {
       -o /dev/null || true
   )"
 
-  [[ "$code" =~ ^2[0-9][0-9]$ ]] \
-    || die "UPLOAD ${name} failed (HTTP ${code})"
-
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] || die "UPLOAD ${name} failed (HTTP ${code})"
   log "Uploaded asset ${name}"
 }
 
@@ -684,9 +721,7 @@ gh_download_asset_to() {
       "$url" || true
   )"
 
-  [[ "$code" =~ ^2[0-9][0-9]$ ]] \
-    || die "DOWNLOAD ${name} failed (HTTP ${code})"
-
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] || die "DOWNLOAD ${name} failed (HTTP ${code})"
   log "Downloaded asset ${name} -> ${out}"
 }
 
@@ -694,8 +729,7 @@ perform_releases_sync() {
   ensure_tools_releases
   wait_for_db
 
-  [[ -n "$GH_REMOTE" ]] \
-    || die "GH_REMOTE is required for releases mode"
+  [[ -n "$GH_REMOTE" ]] || die "GH_REMOTE is required for releases mode"
 
   parse_gh_remote
   gh_auth_header
@@ -703,90 +737,32 @@ perform_releases_sync() {
 
   [[ -n "$GH_REL_ID" ]] || { log "No release id (RO without release) -> skip"; return 0; }
 
-  local tmp="${INSTALL_PATH}/_ghrel"
-  rm -rf "$tmp"
-  mkdir -p "$tmp"
+  local tmp
+  tmp="$(mktemp -d "${INSTALL_PATH}/_ghrel.XXXXXX")"
+  cleanup_add_dir "$tmp"
 
   if gh_download_asset_to "${MANIFEST_NAME}" "${tmp}/${MANIFEST_NAME}"; then
     local man sha_remote
     man="$(cat "${tmp}/${MANIFEST_NAME}")"
     sha_remote="$(jq -r '.archive_sha256' <<<"$man")"
 
-    if [[ -n "$SYNC_AUTH_TOKEN" ]]; then
-      if db_is_empty; then
-        log "DB is empty -> restoring from release '${GH_RELEASE_TAG}'"
-
-        local cnt i part
-        cnt="$(jq -r '.chunk_count' <<<"$man")"
-        [[ -n "$cnt" && "$cnt" != "null" ]] \
-          || die "Invalid manifest (chunk_count)"
-
-        for ((i=0;i<cnt;i++)); do
-          part=$(printf '%s.part_%03d' "$ARCHIVE_NAME" "$i")
-          gh_download_asset_to "$part" "${tmp}/${part}" \
-            || die "Missing asset $part"
-        done
-
-        cat "${tmp}/${ARCHIVE_NAME}.part_"* > "${tmp}/${ARCHIVE_NAME}"
-
-        local sha_local
-        sha_local="$(sha256sum "${tmp}/${ARCHIVE_NAME}" | awk '{print $1}')"
-
-        [[ "$sha_local" == "$sha_remote" ]] \
-          || die "DB checksum mismatch: remote=$sha_remote local=$sha_local"
-
-        import_payload "${tmp}/${ARCHIVE_NAME}"
-        SKIP_SCHEMA_RECREATE=1
-
-        log "DB restore completed"
-        rm -rf "$tmp"
-        return 0
-      fi
-
-      local size sha
-      read -r size sha <<<"$(pack_payload)"
-
-      if [[ "$sha" != "$sha_remote" ]]; then
-        log "DB differs from release -> uploading new dump"
-
-        split_archive_into_remote
-
-        gh_delete_assets_by_prefix "${ARCHIVE_NAME}.part_"
-        gh_delete_assets_by_prefix "${MANIFEST_NAME}"
-
-        for f in "${REMOTE_DIR}/${ARCHIVE_NAME}.part_"*; do
-          gh_upload_asset "$f"
-        done
-
-        write_manifest "$(now_utc)" "$size" "$sha"
-        gh_upload_asset "${REMOTE_DIR}/${MANIFEST_NAME}"
-      else
-        log "DB matches release (sha=$sha) -> nothing to upload"
-      fi
-
-      rm -rf "$tmp"
-      return 0
-    else
+    if [[ -z "$SYNC_AUTH_TOKEN" ]]; then
       log "RO: force-restore DB from release '${GH_RELEASE_TAG}'"
 
       local cnt i part
       cnt="$(jq -r '.chunk_count' <<<"$man")"
-      [[ -n "$cnt" && "$cnt" != "null" ]] \
-        || die "Invalid manifest (chunk_count)"
+      [[ -n "$cnt" && "$cnt" != "null" ]] || die "Invalid manifest (chunk_count)"
 
       for ((i=0;i<cnt;i++)); do
         part=$(printf '%s.part_%03d' "$ARCHIVE_NAME" "$i")
-        gh_download_asset_to "$part" "${tmp}/${part}" \
-          || die "Missing asset $part"
+        gh_download_asset_to "$part" "${tmp}/${part}" || die "Missing asset $part"
       done
 
       cat "${tmp}/${ARCHIVE_NAME}.part_"* > "${tmp}/${ARCHIVE_NAME}"
 
       local sha_local
       sha_local="$(sha256sum "${tmp}/${ARCHIVE_NAME}" | awk '{print $1}')"
-
-      [[ "$sha_local" == "$sha_remote" ]] \
-        || die "DB checksum mismatch: remote=$sha_remote local=$sha_local"
+      [[ "$sha_local" == "$sha_remote" ]] || die "DB checksum mismatch: remote=$sha_remote local=$sha_local"
 
       if ! mysql --protocol=TCP \
                  -h "$MYSQL_HOST" \
@@ -801,11 +777,60 @@ perform_releases_sync() {
       SKIP_SCHEMA_RECREATE=1
 
       log "RO DB restore done (sha=$sha_remote)"
-      rm -rf "$tmp"
       return 0
     fi
+
+    # RW mode:
+    if db_is_empty; then
+      log "DB is empty -> restoring from release '${GH_RELEASE_TAG}'"
+
+      local cnt i part
+      cnt="$(jq -r '.chunk_count' <<<"$man")"
+      [[ -n "$cnt" && "$cnt" != "null" ]] || die "Invalid manifest (chunk_count)"
+
+      for ((i=0;i<cnt;i++)); do
+        part=$(printf '%s.part_%03d' "$ARCHIVE_NAME" "$i")
+        gh_download_asset_to "$part" "${tmp}/${part}" || die "Missing asset $part"
+      done
+
+      cat "${tmp}/${ARCHIVE_NAME}.part_"* > "${tmp}/${ARCHIVE_NAME}"
+
+      local sha_local
+      sha_local="$(sha256sum "${tmp}/${ARCHIVE_NAME}" | awk '{print $1}')"
+      [[ "$sha_local" == "$sha_remote" ]] || die "DB checksum mismatch: remote=$sha_remote local=$sha_local"
+
+      import_payload "${tmp}/${ARCHIVE_NAME}"
+      SKIP_SCHEMA_RECREATE=1
+
+      log "DB restore completed"
+      return 0
+    fi
+
+    local size sha
+    read -r size sha <<<"$(pack_payload)"
+
+    if [[ "$sha" != "$sha_remote" ]]; then
+      log "DB differs from release -> uploading new dump"
+
+      split_archive_into_remote
+
+      gh_delete_assets_by_prefix "${ARCHIVE_NAME}.part_"
+      gh_delete_assets_by_prefix "${MANIFEST_NAME}"
+
+      for f in "${REMOTE_DIR}/${ARCHIVE_NAME}.part_"*; do
+        gh_upload_asset "$f"
+      done
+
+      write_manifest "$(now_utc)" "$size" "$sha"
+      gh_upload_asset "${REMOTE_DIR}/${MANIFEST_NAME}"
+    else
+      log "DB matches release (sha=$sha) -> nothing to upload"
+    fi
+
+    return 0
   fi
 
+  # No manifest exists in release
   if [[ -n "$SYNC_AUTH_TOKEN" ]] && ! db_is_empty; then
     log "No manifest at release but token present -> publishing initial dump"
 
@@ -827,7 +852,6 @@ perform_releases_sync() {
     log "RO mode or empty DB: release has no manifest -> leaving DB as-is"
   fi
 
-  rm -rf "$tmp"
   return 0
 }
 
@@ -845,8 +869,7 @@ mkdir -p \
   "$WORK_DIR" \
   "$REMOTE_DIR"
 
-cd "$INSTALL_PATH" \
-  || die "Failed to cd into $INSTALL_PATH"
+cd "$INSTALL_PATH" || die "Failed to cd into $INSTALL_PATH"
 
 wait_for_db
 
@@ -881,8 +904,7 @@ else
 fi
 
 log "Patching license"
-python3 "${INSTALL_PATH}/license_patch.py" lumina \
-  || die "Patch failed"
+python3 "${INSTALL_PATH}/license_patch.py" lumina || die "Patch failed"
 
 chown root:root \
   "${INSTALL_PATH}/lumina_server" \
@@ -912,6 +934,8 @@ fi
 log "Generating TLS cert via local CA"
 
 OPENSSL_CFG="$(mktemp)"
+cleanup_add_file "$OPENSSL_CFG"
+
 cat >"$OPENSSL_CFG" <<EOF
 [req]
 distinguished_name=req_distinguished_name
@@ -947,7 +971,7 @@ openssl x509 \
   -extfile "$OPENSSL_CFG" \
   >/dev/null 2>&1 || die "CRT failed"
 
-rm -f "${CONFIG_PATH}/lumina.csr" "$OPENSSL_CFG"
+rm -f "${CONFIG_PATH}/lumina.csr" "$OPENSSL_CFG" || true
 
 if id -u lumina >/dev/null 2>&1; then
   chown lumina:lumina \

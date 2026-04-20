@@ -4,26 +4,25 @@ set -euo pipefail
 shopt -s nullglob
 
 ################################################################
-# Paths & Constants
+# Global cleanup
 ################################################################
 
-INSTALL_PATH="/opt/hexlicsrv"
+declare -a CLEANUP_FILES=()
+declare -a CLEANUP_DIRS=()
 
-CA_PATH="${INSTALL_PATH}/CA"
-CONFIG_PATH="${INSTALL_PATH}/config"
-LOGS_PATH="${INSTALL_PATH}/logs"
-DATA_PATH="${INSTALL_PATH}/data"
+cleanup_add_file() { CLEANUP_FILES+=("$1"); }
+cleanup_add_dir()  { CLEANUP_DIRS+=("$1"); }
 
-SCHEMA_LOCK="${CONFIG_PATH}/hexlicsrv_schema.lock"
-
-WORK_DIR="${INSTALL_PATH}/_gitmirror"
-REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID:-hexlicsrv}"
-
-ARCHIVE_NAME="data.tar.zst"
-ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
-MANIFEST_NAME="manifest.json"
-
-SKIP_SCHEMA_RECREATE=0
+cleanup() {
+  set +e
+  for f in "${CLEANUP_FILES[@]:-}"; do
+    [[ -n "$f" && -f "$f" ]] && rm -f -- "$f"
+  done
+  for d in "${CLEANUP_DIRS[@]:-}"; do
+    [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+  done
+}
+trap cleanup EXIT
 
 ################################################################
 # App Configuration
@@ -55,6 +54,28 @@ GH_RELEASE_TAG="${GH_RELEASE_TAG:-hexlicsrv}"
 GH_RELEASE_NAME="${GH_RELEASE_NAME:-HexLicSrv}"
 GH_API="${GH_API:-}"
 GH_UPLOAD="${GH_UPLOAD:-}"
+
+################################################################
+# Paths & Constants
+################################################################
+
+INSTALL_PATH="/opt/hexlicsrv"
+
+CA_PATH="${INSTALL_PATH}/CA"
+CONFIG_PATH="${INSTALL_PATH}/config"
+LOGS_PATH="${INSTALL_PATH}/logs"
+DATA_PATH="${INSTALL_PATH}/data"
+
+SCHEMA_LOCK="${CONFIG_PATH}/hexlicsrv_schema.lock"
+
+WORK_DIR="${INSTALL_PATH}/_gitmirror"
+REMOTE_DIR="${WORK_DIR}/backups/${SYNC_HOST_ID}"
+
+ARCHIVE_NAME="data.tar.zst"
+ARCHIVE_PATH="${INSTALL_PATH}/${ARCHIVE_NAME}"
+MANIFEST_NAME="manifest.json"
+
+SKIP_SCHEMA_RECREATE=0
 
 ################################################################
 # Utils
@@ -93,10 +114,32 @@ pack_payload() {
   printf '%s %s\n' "$size" "$sha"
 }
 
+# IMPORTANT: archive is .tar.zst, so we must decompress via zstd.
+# Also do restore atomically via directory swap.
 import_payload() {
-  rm -rf "${DATA_PATH:?}/"* "${DATA_PATH}/."[!.]* 2>/dev/null || true
-  mkdir -p "$DATA_PATH"
-  tar -C "$DATA_PATH" -xpf "$1"
+  local archive="$1"
+  local tmp_dir old_dir
+
+  tmp_dir="$(mktemp -d "${INSTALL_PATH}/_data_restore.XXXXXX")"
+  cleanup_add_dir "$tmp_dir"
+
+  mkdir -p "$tmp_dir"
+
+  # Extract into temp dir
+  zstd -dc -- "$archive" | tar -C "$tmp_dir" -xpf -
+
+  # Swap directories atomically (same filesystem since tmp is under INSTALL_PATH)
+  old_dir="${DATA_PATH}.old.$(date +%s)"
+  if [[ -d "$DATA_PATH" ]]; then
+    mv -- "$DATA_PATH" "$old_dir"
+    cleanup_add_dir "$old_dir"
+  fi
+
+  mv -- "$tmp_dir" "$DATA_PATH"
+  # tmp_dir no longer exists at this path after mv; cleanup will ignore.
+
+  # Best-effort cleanup of old data after successful swap
+  [[ -d "$old_dir" ]] && rm -rf -- "$old_dir" || true
 }
 
 ################################################################
@@ -136,13 +179,14 @@ write_manifest() {
   local parts=( "${REMOTE_DIR}/${ARCHIVE_NAME}.part_"* )
   local cnt="${#parts[@]}"
 
+  # Write numeric fields as numbers (argjson), not strings.
   jq -n \
-    --arg host_id            "${SYNC_HOST_ID}" \
-    --arg timestamp_utc      "$ts" \
-    --arg chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
-    --arg chunk_count        "${cnt}" \
-    --arg archive_size_bytes "${size}" \
-    --arg archive_sha256     "$sha" \
+    --arg host_id       "${SYNC_HOST_ID}" \
+    --arg timestamp_utc "$ts" \
+    --argjson chunk_size_mb      "${SYNC_CHUNK_SIZE_MB}" \
+    --argjson chunk_count        "${cnt}" \
+    --argjson archive_size_bytes "${size}" \
+    --arg archive_sha256 "$sha" \
     '{
        host_id:            $host_id,
        timestamp_utc:      $timestamp_utc,
@@ -158,9 +202,13 @@ write_manifest() {
 restore_from_remote() {
   local tmp sha_remote sha_local
 
+  [[ -f "${REMOTE_DIR}/${MANIFEST_NAME}" ]] \
+    || die "Manifest not found: ${REMOTE_DIR}/${MANIFEST_NAME}"
+
   tmp="${INSTALL_PATH}/_restore"
   rm -rf "$tmp"
   mkdir -p "$tmp"
+  cleanup_add_dir "$tmp"
 
   assemble_remote_archive "$tmp/${ARCHIVE_NAME}"
 
@@ -171,7 +219,6 @@ restore_from_remote() {
     || die "Checksum mismatch: remote=$sha_remote local=$sha_local"
 
   import_payload "$tmp/${ARCHIVE_NAME}"
-  rm -rf "$tmp"
 
   SKIP_SCHEMA_RECREATE=1
   log "Restore completed (sha=$sha_remote)"
@@ -296,7 +343,8 @@ gh_git_pull_hard() {
   else
     log "Remote branch '${GH_BRANCH}' not found (remote empty?)"
     git -C "$WORK_DIR" checkout --orphan "$GH_BRANCH"
-    git -C "$WORK_DIR" reset --hard
+    # Robust cleanup for orphan/unborn branch
+    git -C "$WORK_DIR" rm -rf . >/dev/null 2>&1 || true
     git -C "$WORK_DIR" clean -xfd
   fi
 
@@ -324,7 +372,7 @@ perform_commits_sync() {
     return 0
   fi
 
-  if [[ -z "$(ls -A "$DATA_PATH" 2>/dev/null)" && -n "$man" ]]; then
+  if [[ -z "$(ls -A "$DATA_PATH" 2>/dev/null || true)" && -n "$man" ]]; then
     log "FS empty -> restore from repo snapshot"
     restore_from_remote
     return 0
@@ -448,8 +496,14 @@ http_json() {
   local data="${3:-}"
   local ctype="${4:-application/json}"
 
+  # Cleanup previous temp file (if any)
+  if [[ -n "${HTTP_BODY_FILE:-}" && -f "${HTTP_BODY_FILE:-}" ]]; then
+    rm -f -- "${HTTP_BODY_FILE}" || true
+  fi
+
   local tmp
   tmp="$(mktemp)"
+  cleanup_add_file "$tmp"
 
   local code
   if [[ -n "$data" ]]; then
@@ -637,6 +691,7 @@ perform_releases_sync() {
   local tmp="${INSTALL_PATH}/_ghrel"
   rm -rf "$tmp"
   mkdir -p "$tmp"
+  cleanup_add_dir "$tmp"
 
   if gh_download_asset_to "${MANIFEST_NAME}" "${tmp}/${MANIFEST_NAME}"; then
     local man sha_remote
@@ -821,6 +876,8 @@ fi
 log "Generating TLS cert via local CA"
 
 OPENSSL_CFG="$(mktemp)"
+cleanup_add_file "$OPENSSL_CFG"
+
 cat >"$OPENSSL_CFG" <<EOF
 [req]
 distinguished_name=req_distinguished_name
@@ -856,7 +913,7 @@ openssl x509 \
   -extfile "$OPENSSL_CFG" \
   >/dev/null 2>&1 || die "CRT failed"
 
-rm -f "${CONFIG_PATH}/hexlicsrv.csr" "$OPENSSL_CFG"
+rm -f "${CONFIG_PATH}/hexlicsrv.csr" "$OPENSSL_CFG" || true
 
 if id -u hexlicsrv >/dev/null 2>&1; then
   chown hexlicsrv:hexlicsrv \

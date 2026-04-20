@@ -1,239 +1,182 @@
 # IDATeamsDocker
 
-Docker configuration for hosting **HexVault**, **Lumina**, and **HexLicSrv**.  
-Installer files go into each service’s `./<service>/image` folder.
+Simple Docker setup for:
+- HexLicSrv
+- HexVault
+- Lumina (with MySQL)
 
-Supported version:
+Installers are not included in this repository. Put each installer into the matching `image/` folder.
 
-- [IDA 9.0.240925 - September 30, 2024](https://docs.hex-rays.com/release-notes/9_0)
-- [IDA 9.1.250226 - February 28, 2025](https://docs.hex-rays.com/release-notes/9_1)
-- [IDA 9.2.250908 - September 8, 2025](https://docs.hex-rays.com/release-notes/9_2)
+Supported installer versions:
+- [IDA 9.0](https://docs.hex-rays.com/release-notes/9_0)
+- [IDA 9.1](https://docs.hex-rays.com/release-notes/9_1)
+- [IDA 9.2](https://docs.hex-rays.com/release-notes/9_2)
+- [IDA 9.3](https://docs.hex-rays.com/release-notes/9_3)
+- [IDA 9.3sp1](https://docs.hex-rays.com/release-notes/9_3sp1)
 
----
+## Repository Layout
 
-## Repository layout
+- `hexlicsrv/` - HexLicSrv image, config, data, logs, CA
+- `hexvault/` - HexVault image, config, data, logs, CA
+- `lumina/` - Lumina image, config, data, logs, CA, and MySQL volume
+- `ida/` - helper `license_patch.py` for local IDA client patching
+- `shell.9.0.reg`, `shell.9.1.reg`, `shell.9.2.reg`, `shell.9.3.reg` - Windows context-menu shortcuts
 
-```
-.
-├─ docker-compose.yml              # runs all services (hexlicsrv, hexvault, lumina + mysql)
-├─ hexlicsrv/
-│  ├─ image/                       # put hexlicsrv installer here (e.g., hexlicsrv_x64linux.run)
-│  ├─ CA/                          # CA.pem + CA.key
-│  ├─ config/                      # persistent config (mounted)
-│  ├─ data/                        # persistent data (mounted)
-│  └─ logs/                        # persistent logs (mounted)
-├─ hexvault/
-│  ├─ image/                       # put hexvault installer here (e.g., hexvault_x64linux.run)
-│  ├─ CA/  config/  data/  logs/
-└─ lumina/
-   ├─ image/                       # put lumina installer here (e.g., lumina_x64linux.run)
-   ├─ CA/  config/  data/  logs/
-   └─ mysql/                       # MySQL persistent volume
-```
+## Requirements
 
----
+- Linux host with Docker + Docker Compose
+- A CA pair: `CA.pem` and `CA.key`
+- Installers:
+  - `hexlicsrv/image/hexlicsrv_x64linux.run`
+  - `hexvault/image/hexvault_x64linux.run`
+  - `lumina/image/lumina_x64linux.run`
 
-## Prerequisites
+## Quick Start
 
-- Linux host with Docker and Docker Compose
-- Your own internal Certificate Authority (CA) pair: `CA.pem` (cert) and `CA.key` (private key)
-- For **Lumina**: MySQL 8 (provided by the included `mysql` service)
-
----
-
-## Generate your CA (required)
-
-Create a CA once and place it **into every service’s `CA/` folder**:
+1. Create a CA (once):
 
 ```bash
 openssl req -x509 \
-    -newkey rsa:4096 -sha512 -keyout CA.key -out CA.pem -days 3650 -nodes \
-    -subj "/C=BE/L=Liège/O=Hex-Rays SA./CN=Hex-Rays SA. Root CA"
+  -newkey rsa:4096 -sha512 -keyout CA.key -out CA.pem -days 3650 -nodes \
+  -subj "/C=BE/L=Liege/O=Hex-Rays SA./CN=Hex-Rays SA. Root CA"
 ```
 
-> The containers refuse to start if `CA/CA.pem` or `CA/CA.key` is missing.
-
----
-
-## Prepare your IDA client
-
-1. Create `C:\Program Files\IDA Professional 9.0\CA`
-2. Copy your `CA.key` and `CA.pem` into that folder
-3. Copy `license_patch.py` into the IDA install root
-4. Run as Administrator:
-   ```bash
-   python3 license_patch.py ida-pro
-   ```
-5. Start IDA
-
----
-
-## Running with Docker Compose (recommended)
-
-The provided top-level `docker-compose.yml` brings up all services:
-
-- **hexlicsrv** --> port **65434**
-- **hexvault** --> port **65433**
-- **mysql** for **lumina**
-- **lumina** --> port **443**
-
-### 1) Put installers into image folders
-
-- `hexlicsrv/image/hexlicsrv_x64linux.run`
-- `hexvault/image/hexvault_x64linux.run`
-- `lumina/image/lumina_x64linux.run`
-
-### 2) Put CA into each service
-
-Copy `CA.key` and `CA.pem` into:
-
+2. Copy `CA.pem` and `CA.key` into:
 - `hexlicsrv/CA/`
 - `hexvault/CA/`
 - `lumina/CA/`
 
-### 3) Adjust hostnames (TLS SAN)
+3. Adjust hostnames in compose files:
+- `hexlicsrv/docker-compose.yml`: `LICENSE_HOST`
+- `hexvault/docker-compose.yml`: `VAULT_HOST`
+- `lumina/docker-compose.yml`: `LUMINA_HOST`
 
-Edit environment in `docker-compose.yml`:
+4. Configure MySQL secrets for Lumina:
+- Copy `.env.example` to `.env` (for example: `cp .env.example .env`)
+- Set strong values for `MYSQL_PASSWORD` and `MYSQL_ROOT_PASSWORD`
 
-- `LICENSE_HOST` for **hexlicsrv**
-- `VAULT_HOST` for **hexvault**
-- `LUMINA_HOST` for **lumina**
-
-These become the **CN/SAN** in the auto-issued service certificates.
-
-### 4) Bring everything up
+5. Start services (from repository root):
 
 ```bash
-docker compose up -d --build
+docker compose -f hexlicsrv/docker-compose.yml up -d --build
+docker compose -f hexvault/docker-compose.yml up -d --build
+docker compose -f lumina/docker-compose.yml up -d --build
 ```
 
-> The entrypoints run `license_patch.py` inside each container automatically.
+6. Default ports:
+- HexLicSrv: `65434`
+- HexVault: `65433`
+- Lumina: `443`
 
----
+## IDA Client Setup (Windows)
 
-## Service-specific notes
+1. Create `C:\Program Files\IDA Professional <version>\CA`
+2. Put only `CA.pem` there
+3. Copy `ida/license_patch.py` into your IDA install directory
+4. Run as Administrator:
 
-### HexLicSrv
-- Mounts: `./hexlicsrv/{CA,config,data,logs}` --> `/opt/hexlicsrv/...`
-- Config file auto-generated at first start: `config/hexlicsrv.conf`
+```bash
+python3 license_patch.py ida-pro
+```
 
-### HexVault
-- Mounts: `./hexvault/{CA,config,data,logs}` --> `/opt/hexvault/...`
-- Config file auto-generated at first start: `config/hexvault.conf`
+## Optional GitHub Sync
 
-### Lumina
-- Depends on the `mysql` service (health-checked)
-- DB env must match `mysql` service:
-  - `MYSQL_HOST=mysql`, `MYSQL_PORT=3306`, `MYSQL_DATABASE=lumina`, `MYSQL_USER=lumina`, `MYSQL_PASSWORD=lumina`
-- Mounts: `./lumina/{CA,config,data,logs}` --> `/opt/lumina/...`
-- Config file auto-generated at first start: `config/lumina.conf`
+Each service can backup/restore state to GitHub on container start.
 
----
+How it works:
+- If local state is empty and a remote snapshot exists, the service restores from GitHub.
+- If local state is not empty, the service creates a new snapshot and uploads only when data changed.
+- `hexlicsrv` and `hexvault` sync filesystem data.
+- `lumina` syncs MySQL dump.
 
-## Unified GitHub Sync (optional but recommended)
+Where to configure:
+- Add sync variables to the `environment:` block of the needed service in:
+  - `hexlicsrv/docker-compose.yml`
+  - `hexvault/docker-compose.yml`
+  - `lumina/docker-compose.yml`
 
-All three services can **backup/restore** their state to GitHub in one of two modes:
-
-- **commits**: push chunks + `manifest.json` into a branch under `backups/<SYNC_HOST_ID>/`
-- **releases**: upload chunks + `manifest.json` as **release assets** of a tag
-
-### How it works (on container start)
-
-- If local data is **empty** and a remote snapshot exists --> **restore**
-- Else package local state and **push only if changed** (SHA-256 compare)
-
-### Packaging
-
-- **HexLicSrv / HexVault:** `tar` --> `zstd -19` --> `data.tar.zst` --> split --> `data.tar.zst.part_000`, `...001`, ...
-- **Lumina:** `mysqldump` --> `zstd -19` --> `dump.sql.zst` --> split --> `dump.sql.zst.part_000`, ...
-
-`manifest.json` stores (among others): `archive_sha256`, `chunk_count`, `chunk_size_mb`, `timestamp_utc`.
-
-> Keep `SYNC_CHUNK_SIZE_MB ≤ 49` for GitHub’s 50 MB file limit in repos (default is `49`).
-
-### Enable sync
-
-In `docker-compose.yml`, per service set:
+### 1) Common variables (for any service)
 
 ```yaml
 environment:
-  SYNC_ENABLED: "true"                 # enable sync
-  SYNC_METHOD: "releases"              # or "commits"
-  GH_REMOTE: https://github.com/yourorg/yourrepo.git  # or SSH: git@github.com:yourorg/yourrepo.git
-  SYNC_HOST_ID: "hexvault"             # logical node id, used in path under commits mode
-  SYNC_CHUNK_SIZE_MB: "49"
-
-  # For write access / private repos or releases:
-  # SYNC_AUTH_TOKEN: github_pat_token_here
-
-  # Commits mode (optional identity)
-  # GH_BRANCH: main
-  # GH_COMMIT_NAME: HexVault CI
-  # GH_COMMIT_EMAIL: hexvault@example.com
-  # GH_SSH_PRIVATE_KEY: |-
-  #   -----BEGIN OPENSSH PRIVATE KEY-----
-  #   ...
-  # GH_KNOWN_HOSTS: |-
-  #   github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...
-
-  # Releases mode
-  # GH_RELEASE_TAG: hexvault
-  # GH_RELEASE_NAME: HexVault
-  # GH_API: https://ghe.example.com/api/v3         # for GHE
-  # GH_UPLOAD: https://ghe.example.com/api/uploads # for GHE
+  SYNC_ENABLED: "true"
+  SYNC_METHOD: "commits" # or "releases"
+  GH_REMOTE: "https://github.com/yourorg/yourrepo.git"
+  SYNC_HOST_ID: "hexvault-prod-01"   # unique node id
+  SYNC_CHUNK_SIZE_MB: "49"           # keep <= 49 for GitHub limits
 ```
 
-> **PAT vs SSH**: For HTTPS URLs set `SYNC_AUTH_TOKEN` (Bearer for releases, x-access-token for commits). For SSH, provide `GH_SSH_PRIVATE_KEY` and optionally `GH_KNOWN_HOSTS`.
+Notes:
+- `SYNC_HOST_ID` should be unique per node/environment.
+- For private repos and uploads, provide auth (token or SSH key).
+- For HTTPS remotes without `SYNC_AUTH_TOKEN`, sync works in read-only mode (restore only, no upload).
 
----
+### 2) Commits mode (store chunks in branch files)
 
-## Schema lock files
+Required:
+- `SYNC_METHOD=commits`
+- `GH_REMOTE`
+- `SYNC_HOST_ID`
 
-A `*_schema.lock` file prevents schema recreation on subsequent boots.  
-Delete the lock if you intentionally want the service to run `--recreate-schema` again.
+Optional:
+- `GH_BRANCH` (default `main`)
+- `GH_COMMIT_NAME`, `GH_COMMIT_EMAIL`
+- `SYNC_AUTH_TOKEN` for HTTPS write access
+- `GH_SSH_PRIVATE_KEY` (+ optionally `GH_KNOWN_HOSTS`) for SSH
 
----
+Example:
+
+```yaml
+environment:
+  SYNC_ENABLED: "true"
+  SYNC_METHOD: "commits"
+  GH_REMOTE: "https://github.com/yourorg/yourrepo.git"
+  GH_BRANCH: "main"
+  SYNC_HOST_ID: "hexlicsrv-prod-01"
+  SYNC_AUTH_TOKEN: "${SYNC_AUTH_TOKEN}"
+```
+
+### 3) Releases mode (store chunks as release assets)
+
+Required:
+- `SYNC_METHOD=releases`
+- `GH_REMOTE`
+- `SYNC_HOST_ID`
+
+Optional:
+- `GH_RELEASE_TAG` (default service name)
+- `GH_RELEASE_NAME`
+- `GH_API` and `GH_UPLOAD` for GitHub Enterprise
+- `SYNC_AUTH_TOKEN` for creating/updating release assets
+
+Example:
+
+```yaml
+environment:
+  SYNC_ENABLED: "true"
+  SYNC_METHOD: "releases"
+  GH_REMOTE: "https://github.com/yourorg/yourrepo.git"
+  GH_RELEASE_TAG: "lumina-prod"
+  GH_RELEASE_NAME: "Lumina Prod Snapshot"
+  SYNC_HOST_ID: "lumina-prod-01"
+  SYNC_AUTH_TOKEN: "${SYNC_AUTH_TOKEN}"
+```
+
+### 4) Quick check after start
+
+- Read container logs and find lines about `restore`, `checksum`, `uploaded`, or `nothing to upload`.
+- If nothing is uploaded, usually it means data hash is unchanged (this is normal).
+- In `commits` mode, snapshots are stored in repo files under `backups/<SYNC_HOST_ID>/`.
+- In `releases` mode, snapshots are stored as release assets under `GH_RELEASE_TAG`.
 
 ## Troubleshooting
 
-- **World-accessible config (HexLicSrv)**  
-  **Symptom:**  
-  `File "/opt/hexlicsrv/config/hexlicsrv.conf" is world-accessible; exiting`  
-  **Fix:**  
-  ```bash
-  chmod 600 config/hexlicsrv.conf
-  ```
+- Missing CA files: container exits early. Check `CA/CA.pem` and `CA/CA.key`.
+- Permission errors on config: set strict permissions (for example `chmod 600` on config files).
+- Sync issues: verify `GH_REMOTE`, token/key, and repository permissions.
 
-- **World-accessible config (HexVault)**  
-  **Symptom:**  
-  `File "/opt/hexvault/config/hexvault.conf" is world-accessible; exiting`  
-  **Fix:**  
-  ```bash
-  chmod 600 config/hexvault.conf
-  ```
+## Security Notes
 
-- **Missing tools**  
-  Images must include: `git`, `ssh-keyscan`, `curl`, `tar`, `zstd`, `jq`, `sha256sum`, `split`, `openssl`, and for Lumina also `mysql`, `mysqldump`, `nc`.
-
-- **Auth / permissions fail**  
-  Verify `GH_REMOTE`, token/SSH key validity, and repo access. For SSH, either supply `GH_KNOWN_HOSTS` or the entrypoint will disable strict host checking (less secure).
-
-- **Checksum mismatch on restore**  
-  Means the assembled archive’s SHA-256 differs from `manifest.json`.  
-  Fix by republishing a clean snapshot (run with `SYNC_AUTH_TOKEN` so the container uploads a fresh manifest and parts), or remove release/branch assets and let the container recreate them.
-
-- **No changes to commit**  
-  Normal when the computed SHA-256 equals the remote manifest; nothing is pushed.
-
----
-
-## Windows `shell.<IDA version>.reg`
-
-Adds a context-menu entry to open files with IDA on Windows.
-
---- 
-
-## Security notes
-
-- Never commit tokens or private keys. Use Docker secrets, env injection in CI, or a secrets manager.
-- Your CA private key is sensitive; restrict filesystem permissions and repo access accordingly.
+- Never commit tokens, SSH private keys, or CA private keys.
+- Do not copy `CA.key` to client workstations.
+- Restrict permissions for all secrets and config files.

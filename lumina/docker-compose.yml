@@ -6,10 +6,10 @@ services:
     container_name: mysql
     restart: unless-stopped
     environment:
-      MYSQL_DATABASE: "lumina"
-      MYSQL_USER: "lumina"
-      MYSQL_PASSWORD: "lumina"
-      MYSQL_ROOT_PASSWORD: "rootpass"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-lumina}"
+      MYSQL_USER: "${MYSQL_USER:-lumina}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env or environment}"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env or environment}"
     command: ["--default-authentication-plugin=mysql_native_password"]
     volumes:
       - ./db_data:/var/lib/mysql
@@ -35,9 +35,9 @@ services:
       # === Database (must match the mysql service above) ===
       MYSQL_HOST: "mysql"
       MYSQL_PORT: "3306"
-      MYSQL_DATABASE: "lumina"
-      MYSQL_USER: "lumina"
-      MYSQL_PASSWORD: "lumina"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-lumina}"
+      MYSQL_USER: "${MYSQL_USER:-lumina}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env or environment}"
 
       # Optional: if Lumina should build the "vault" schema flavor
       VAULT_HOST: reversing.example.com
